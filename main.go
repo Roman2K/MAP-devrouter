@@ -96,11 +96,11 @@ func route(w http.ResponseWriter, r *http.Request) {
 		publicHandler.ServeHTTP(w, r)
 		return
 	}
+	rlog.Infof("proxying to %s", mapURL)
 	proxy(w, r)
 }
 
 func proxy(w http.ResponseWriter, r *http.Request) {
-	log.Infof("new request: %s => %s", r.URL.Path, mapURL)
 	r2, err := http.NewRequest(r.Method, mapURL+r.URL.Path, r.Body)
 	if err != nil {
 		w.WriteHeader(502)
