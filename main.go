@@ -99,11 +99,6 @@ func route(w http.ResponseWriter, r *http.Request) {
 	proxy(w, r)
 }
 
-func handleCmsImage(w http.ResponseWriter, r *http.Request) {
-	log.Infof("new request: CmsImage %s", r.URL.Path)
-	w.WriteHeader(404)
-}
-
 func proxy(w http.ResponseWriter, r *http.Request) {
 	log.Infof("new request: %s => %s", r.URL.Path, mapURL)
 	r2, err := http.NewRequest(r.Method, mapURL+r.URL.Path, r.Body)
