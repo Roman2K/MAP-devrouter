@@ -10,10 +10,10 @@ import (
 	"regexp"
 	"runtime"
 
+	log "gopkg.in/Sirupsen/logrus.v0"
+
 	"./typestat"
 )
-
-import log "gopkg.in/Sirupsen/logrus.v0"
 
 // config
 var addr = flag.String("addr", ":8080", "Address to listen on")
