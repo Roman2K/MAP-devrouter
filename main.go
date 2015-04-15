@@ -3,9 +3,9 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io"
-	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -17,10 +17,10 @@ import (
 
 // config
 var addr = flag.String("addr", ":8080", "Address to listen on")
-var mapArg = flag.String("map", ":3000", "MAP Rails server address")
+var mapURL = flag.String("map", "http://localhost:3000", "MAP Rails server address")
 
 // package globals
-var mapURL string
+var mapProxy *httputil.ReverseProxy
 var static = map[string]http.HandlerFunc{}
 var public = http.Dir("../map/public")
 var publicHandler http.Handler
@@ -46,30 +46,16 @@ func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	flag.Parse()
-	url, err := buildMAPURL(*mapArg)
+	url, err := url.Parse(*mapURL)
 	if err != nil {
 		log.Fatal(err)
 	}
-	mapURL = url
+	mapProxy = httputil.NewSingleHostReverseProxy(url)
 
 	log.SetLevel(log.DebugLevel)
-	log.Infof("Proxying MAP requests to %s", mapURL)
+	log.Infof("Proxying MAP requests to %s", url)
 	log.Infof("Listening on %s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, http.HandlerFunc(route)))
-}
-
-func buildMAPURL(addr string) (string, error) {
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return "", err
-	}
-	if host == "" {
-		host = "localhost"
-	}
-	if port == "" {
-		port = "3000"
-	}
-	return "http://" + host + ":" + port, nil
 }
 
 func route(w http.ResponseWriter, r *http.Request) {
@@ -96,33 +82,6 @@ func route(w http.ResponseWriter, r *http.Request) {
 		publicHandler.ServeHTTP(w, r)
 		return
 	}
-	rlog.Infof("proxying to %s", mapURL)
-	proxy(w, r)
-}
-
-func proxy(w http.ResponseWriter, r *http.Request) {
-	r2, err := http.NewRequest(r.Method, mapURL+r.URL.Path, r.Body)
-	if err != nil {
-		w.WriteHeader(502)
-		return
-	}
-	copyHeader(r2.Header, r.Header)
-	r2.Host = r.Host
-	client := http.Client{}
-	resp, err := client.Do(r2)
-	if err != nil {
-		// TODO respond with 503
-		w.WriteHeader(502)
-		return
-	}
-	defer resp.Body.Close()
-	copyHeader(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
-}
-
-func copyHeader(dst, src http.Header) {
-	for key := range src {
-		dst.Set(key, src.Get(key))
-	}
+	rlog.Infof("proxying to %s", *mapURL)
+	mapProxy.ServeHTTP(w, r)
 }
