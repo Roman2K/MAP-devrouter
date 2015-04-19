@@ -13,7 +13,7 @@ import (
 
 	log "gopkg.in/Sirupsen/logrus.v0"
 
-	"./typestat"
+	"./filetest"
 )
 
 // config
@@ -30,7 +30,7 @@ var publicHandler http.Handler
 var uploadsCMSRe *regexp.Regexp
 
 func init() {
-	ok, err := typestat.IsDir(string(public))
+	ok, err := filetest.IsDir(string(public))
 	if err != nil {
 		panic(err)
 	}
@@ -80,7 +80,7 @@ func route(w http.ResponseWriter, r *http.Request) {
 		publicHandler.ServeHTTP(w, r)
 		return
 	}
-	ok, err := typestat.IsFile(filepath.Join(string(public), r.URL.Path))
+	ok, err := filetest.IsFile(filepath.Join(string(public), r.URL.Path))
 	if err != nil {
 		rlog.Errorf("while testing file: %v", err)
 		w.WriteHeader(500)

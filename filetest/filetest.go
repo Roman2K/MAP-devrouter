@@ -1,4 +1,4 @@
-package typestat
+package filetest
 
 import "os"
 
