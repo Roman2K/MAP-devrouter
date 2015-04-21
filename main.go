@@ -3,13 +3,13 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"strings"
 
 	log "gopkg.in/Sirupsen/logrus.v0"
 
@@ -19,11 +19,11 @@ import (
 // config
 var addr = flag.String("addr", ":8080", "Address to listen on")
 var mapURL = flag.String("map", "http://localhost:3000", "MAP (ecommerce) server URL")
-var storageURL = flag.String("storage", "http://localhost:3010", "MAP-storage server URL")
+var editorURL = flag.String("editor", "http://localhost:3001", "Editor server URL")
 
 // package globals
 var mapProxy *httputil.ReverseProxy
-var storageProxy *httputil.ReverseProxy
+var editorProxy *httputil.ReverseProxy
 var static = map[string]http.HandlerFunc{}
 var public = http.Dir("../map/public")
 var publicHandler http.Handler
@@ -50,11 +50,11 @@ func main() {
 
 	flag.Parse()
 	setProxy(&mapProxy, *mapURL)
-	setProxy(&storageProxy, *storageURL)
+	setProxy(&editorProxy, *editorURL)
 
 	log.SetLevel(log.DebugLevel)
 	log.Infof("proxying MAP requests to %s", *mapURL)
-	log.Infof("proxying MAP-storage requests to %s", *storageURL)
+	log.Infof("proxying Editor requests to %s", *editorURL)
 	log.Infof("listening on %s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, http.HandlerFunc(route)))
 }
@@ -68,7 +68,18 @@ func setProxy(ptr **httputil.ReverseProxy, rawurl string) {
 }
 
 func route(w http.ResponseWriter, r *http.Request) {
-	rlog := log.WithFields(log.Fields{"path": r.URL.Path})
+	host, _, err := net.SplitHostPort(r.Host)
+	if err != nil {
+		log.Error("failed to extract domain from Host: %s", r.Host)
+		w.WriteHeader(500)
+		return
+	}
+	rlog := log.WithFields(log.Fields{"Host": host, "path": r.URL.Path})
+	if host == "app.map.dev" {
+		rlog.Info("proxying to Editor")
+		editorProxy.ServeHTTP(w, r)
+		return
+	}
 	if h := static[r.URL.Path]; h != nil {
 		rlog.Info("static path match")
 		h(w, r)
@@ -89,13 +100,6 @@ func route(w http.ResponseWriter, r *http.Request) {
 	if ok {
 		rlog.Info("sending file")
 		publicHandler.ServeHTTP(w, r)
-		return
-	}
-	if p := strings.TrimPrefix(r.URL.Path, "/storage/"); len(p) < len(r.URL.Path) {
-		rlog.Info("proxying to MAP-storage")
-		r.URL.Path = "/" + p
-		rlog.Debugf("path rewritten to %s", r.URL.Path)
-		storageProxy.ServeHTTP(w, r)
 		return
 	}
 	rlog.Info("proxying to MAP")
