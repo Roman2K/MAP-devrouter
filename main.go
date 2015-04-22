@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strings"
 
 	log "gopkg.in/Sirupsen/logrus.v0"
 
@@ -17,17 +18,23 @@ import (
 )
 
 // config
-var addr = flag.String("addr", ":8080", "Address to listen on")
-var mapURL = flag.String("map", "http://localhost:3000", "MAP (ecommerce) server URL")
-var editorURL = flag.String("editor", "http://localhost:3001", "Editor server URL")
+var (
+	addr       = flag.String("addr", ":8080", "Address to listen on")
+	mapURL     = flag.String("map", "http://localhost:3000", "MAP (ecommerce) server URL")
+	editorURL  = flag.String("editor", "http://localhost:3001", "Editor server URL")
+	storageURL = flag.String("storage", "http://localhost:3010", "Storage server URL")
+)
 
 // package globals
-var mapProxy *httputil.ReverseProxy
-var editorProxy *httputil.ReverseProxy
-var static = map[string]http.HandlerFunc{}
-var public = http.Dir("../map/public")
-var publicHandler http.Handler
-var uploadsCMSRe *regexp.Regexp
+var (
+	mapProxy      *httputil.ReverseProxy
+	editorProxy   *httputil.ReverseProxy
+	storageProxy  *httputil.ReverseProxy
+	static        = map[string]http.HandlerFunc{}
+	public        = http.Dir("../map/public")
+	publicHandler http.Handler
+	uploadsCMSRe  *regexp.Regexp
+)
 
 func init() {
 	ok, err := filetest.IsDir(string(public))
@@ -51,6 +58,7 @@ func main() {
 	flag.Parse()
 	setProxy(&mapProxy, *mapURL)
 	setProxy(&editorProxy, *editorURL)
+	setProxy(&storageProxy, *storageURL)
 
 	log.SetLevel(log.DebugLevel)
 	log.Infof("proxying MAP requests to %s", *mapURL)
@@ -67,6 +75,43 @@ func setProxy(ptr **httputil.ReverseProxy, rawurl string) {
 	*ptr = httputil.NewSingleHostReverseProxy(url)
 }
 
+type ResponseWriter struct {
+	final   http.ResponseWriter
+	req     *http.Request
+	log     *log.Entry
+	written bool
+}
+
+func (w *ResponseWriter) Header() http.Header {
+	return w.final.Header()
+}
+
+func (w *ResponseWriter) Write(chunk []byte) (int, error) {
+	w.written = true
+	return w.final.Write(chunk)
+}
+
+func (w *ResponseWriter) WriteHeader(status int) {
+	if redir := w.final.Header().Get("X-Accel-Redirect"); redir != "" {
+		rlog := w.log.WithFields(log.Fields{"X-Accel-Redirect": redir})
+		if w.written {
+			rlog.Errorf("attempted to X-Accel-Redirect after write")
+		} else {
+			if path := strings.TrimPrefix(redir, "/storage/"); len(path) < len(redir) {
+				rlog.Debugf("proxying to Storage")
+				w.req.URL.Path = path
+				w.written = true
+				w.Header().Del("Content-Length")
+				storageProxy.ServeHTTP(w.final, w.req)
+				return
+			}
+			rlog.Debugf("unhandled X-Accel-Redirect")
+		}
+	}
+	w.written = true
+	w.final.WriteHeader(status)
+}
+
 func route(w http.ResponseWriter, r *http.Request) {
 	host, _, err := net.SplitHostPort(r.Host)
 	if err != nil {
@@ -75,6 +120,7 @@ func route(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rlog := log.WithFields(log.Fields{"Host": host, "path": r.URL.Path})
+	w = &ResponseWriter{w, r, rlog, false}
 	if host == "app.map.dev" {
 		rlog.Info("proxying to Editor")
 		editorProxy.ServeHTTP(w, r)
