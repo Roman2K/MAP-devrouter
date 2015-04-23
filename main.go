@@ -27,13 +27,14 @@ var (
 
 // package globals
 var (
-	mapProxy      *httputil.ReverseProxy
-	editorProxy   *httputil.ReverseProxy
-	storageProxy  *httputil.ReverseProxy
-	static        = map[string]http.HandlerFunc{}
-	public        = http.Dir("../map/public")
-	publicHandler http.Handler
-	uploadsCMSRe  *regexp.Regexp
+	mapProxy                 *httputil.ReverseProxy
+	editorProxy              *httputil.ReverseProxy
+	storageProxy             *httputil.ReverseProxy
+	static                   = map[string]http.HandlerFunc{}
+	public                   = http.Dir("../map/public")
+	publicHandler            http.Handler
+	uploadsCMSRe             *regexp.Regexp
+	xAccelRedirectHopHeaders = []string{"X-Accel-Redirect", "Content-Type", "Content-Length"}
 )
 
 func init() {
@@ -75,43 +76,6 @@ func setProxy(ptr **httputil.ReverseProxy, rawurl string) {
 	*ptr = httputil.NewSingleHostReverseProxy(url)
 }
 
-type ResponseWriter struct {
-	final   http.ResponseWriter
-	req     *http.Request
-	log     *log.Entry
-	written bool
-}
-
-func (w *ResponseWriter) Header() http.Header {
-	return w.final.Header()
-}
-
-func (w *ResponseWriter) Write(chunk []byte) (int, error) {
-	w.written = true
-	return w.final.Write(chunk)
-}
-
-func (w *ResponseWriter) WriteHeader(status int) {
-	if redir := w.final.Header().Get("X-Accel-Redirect"); redir != "" {
-		rlog := w.log.WithFields(log.Fields{"X-Accel-Redirect": redir})
-		if w.written {
-			rlog.Errorf("attempted to X-Accel-Redirect after write")
-		} else {
-			if path := strings.TrimPrefix(redir, "/storage/"); len(path) < len(redir) {
-				rlog.Debugf("proxying to Storage")
-				w.req.URL.Path = path
-				w.written = true
-				w.Header().Del("Content-Length")
-				storageProxy.ServeHTTP(w.final, w.req)
-				return
-			}
-			rlog.Debugf("unhandled X-Accel-Redirect")
-		}
-	}
-	w.written = true
-	w.final.WriteHeader(status)
-}
-
 func route(w http.ResponseWriter, r *http.Request) {
 	host, _, err := net.SplitHostPort(r.Host)
 	if err != nil {
@@ -150,4 +114,43 @@ func route(w http.ResponseWriter, r *http.Request) {
 	}
 	rlog.Info("proxying to MAP")
 	mapProxy.ServeHTTP(w, r)
+}
+
+type ResponseWriter struct {
+	final   http.ResponseWriter
+	req     *http.Request
+	log     *log.Entry
+	written bool
+}
+
+func (w *ResponseWriter) Header() http.Header {
+	return w.final.Header()
+}
+
+func (w *ResponseWriter) Write(chunk []byte) (int, error) {
+	w.written = true
+	return w.final.Write(chunk)
+}
+
+func (w *ResponseWriter) WriteHeader(status int) {
+	if redir := w.final.Header().Get("X-Accel-Redirect"); redir != "" {
+		rlog := w.log.WithFields(log.Fields{"X-Accel-Redirect": redir})
+		if w.written {
+			rlog.Errorf("attempted to X-Accel-Redirect after write")
+		} else {
+			if path := strings.TrimPrefix(redir, "/storage/"); len(path) < len(redir) {
+				rlog.Debugf("proxying to Storage")
+				w.req.URL.Path = path
+				for _, key := range xAccelRedirectHopHeaders {
+					w.Header().Del(key)
+				}
+				w.written = true
+				storageProxy.ServeHTTP(w.final, w.req)
+				return
+			}
+			rlog.Debugf("unhandled X-Accel-Redirect")
+		}
+	}
+	w.written = true
+	w.final.WriteHeader(status)
 }
