@@ -1,0 +1,3 @@
+package: github.com/Roman2K/MAP-devrouter
+import:
+- package: gopkg.in/Sirupsen/logrus.v0

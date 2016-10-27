@@ -14,7 +14,7 @@ import (
 
 	log "gopkg.in/Sirupsen/logrus.v0"
 
-	"./filetest"
+	"github.com/Roman2K/MAP-devrouter/filetest"
 )
 
 // config
