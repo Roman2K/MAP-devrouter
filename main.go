@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -19,138 +20,223 @@ import (
 
 // config
 var (
-	addr       = flag.String("addr", ":8080", "Address to listen on")
-	mapURL     = flag.String("map", "http://localhost:3000", "MAP (ecommerce) server URL")
-	editorURL  = flag.String("editor", "http://localhost:3001", "Editor server URL")
-	storageURL = flag.String("storage", "http://localhost:3010", "Storage server URL")
+	addr            = flag.String("addr", ":8080", "Address to listen on")
+	mapURL          = flag.String("map", "http://localhost:3000", "MAP (ecommerce) server URL")
+	mapPublicDir    = flag.String("map-public", "~/code/map/map/public", "Path to public dir of MAP")
+	editorURL       = flag.String("editor", "http://localhost:3001", "Editor server URL")
+	editorPublicDir = flag.String("editor-public", "~/code/map/editor/public", "Path to public dir of Editor")
+	storageURL      = flag.String("storage", "http://localhost:3010", "Storage server URL")
 )
 
 // package globals
 var (
-	mapProxy                 *httputil.ReverseProxy
-	editorProxy              *httputil.ReverseProxy
-	storageProxy             *httputil.ReverseProxy
-	static                   = map[string]http.HandlerFunc{}
-	public                   = http.Dir("../map/public")
-	publicHandler            http.Handler
+	mapProxy                 http.Handler
+	editorProxy              http.Handler
+	storageProxy             http.Handler
 	uploadsCMSRe             *regexp.Regexp
-	xAccelRedirectHopHeaders = []string{"X-Accel-Redirect", "Content-Type", "Content-Length"}
+	mapPublic                fileServer
+	editorPublic             fileServer
+	nop                      []*regexp.Regexp
+	xAccelRedirectHopHeaders = []string{
+		"X-Accel-Redirect",
+		"Content-Type",
+		"Content-Length",
+	}
 )
 
 func init() {
-	ok, err := filetest.IsDir(string(public))
-	if err != nil {
-		panic(err)
-	}
-	if !ok {
-		panic(fmt.Sprintf("public = %q - not a directory", public))
-	}
-
-	uploadsCMSRe = regexp.MustCompile(`^/uploads_cms/(\w+)-image-(\d{1,4})(\d{1,4})?/(.+)$`)
-
-	static["/favicon.ico"] = http.NotFound
-	static["/mini-profiler-resources/results"] = http.NotFound
-	publicHandler = http.FileServer(public)
+	uploadsCMSRe = regexp.MustCompile(`^/uploads_cms/(\w+)-(\w+)-(\d+)/(.+)$`)
+	nop = append(nop,
+		regexp.MustCompile(`/favicon\.ico$`),
+		regexp.MustCompile(`^/mini-profiler`),
+	)
 }
 
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	flag.Parse()
-	setProxy(&mapProxy, *mapURL)
-	setProxy(&editorProxy, *editorURL)
-	setProxy(&storageProxy, *storageURL)
+	mapProxy = newReverseProxy(*mapURL)
+	editorProxy = newReverseProxy(*editorURL)
+	storageProxy = newReverseProxy(*storageURL)
+
+	var err error
+	mapPublic, err = newFileServer(expandHome(*mapPublicDir))
+	if err != nil {
+		panic(err)
+	}
+	editorPublic, err = newFileServer(expandHome(*editorPublicDir))
+	if err != nil {
+		panic(err)
+	}
 
 	log.SetLevel(log.DebugLevel)
-	log.Infof("proxying MAP requests to %s", *mapURL)
-	log.Infof("proxying Editor requests to %s", *editorURL)
+	log.Infof("MAP: proxy to %s", *mapURL)
+	log.Infof("MAP: serve public %s", *mapPublicDir)
+	log.Infof("Editor: proxy to %s", *editorURL)
+	log.Infof("Editor: serve public %s", *editorPublicDir)
+	log.Infof("Storage: proxy to %s", *storageURL)
 	log.Infof("listening on %s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, http.HandlerFunc(route)))
 }
 
-func setProxy(ptr **httputil.ReverseProxy, rawurl string) {
-	url, err := url.Parse(rawurl)
-	if err != nil {
-		log.Fatal(err)
+func expandHome(path string) string {
+	home := os.Getenv("HOME")
+	if home == "" {
+		panic("$HOME not set")
 	}
-	*ptr = httputil.NewSingleHostReverseProxy(url)
+	return strings.Replace(path, "~", home, -1)
+}
+
+type fileServer struct {
+	dir     string
+	handler http.Handler
+}
+
+func newFileServer(dir string) (h fileServer, err error) {
+	ok, err := filetest.IsDir(dir)
+	if err != nil {
+		return
+	}
+	if !ok {
+		err = fmt.Errorf("%q not a directory", dir)
+		return
+	}
+	h = fileServer{
+		dir:     dir,
+		handler: http.FileServer(http.Dir(dir)),
+	}
+	return
+}
+
+func (h fileServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.handler.ServeHTTP(w, r)
+}
+
+func newReverseProxy(urlstr string) http.Handler {
+	url, err := url.Parse(urlstr)
+	if err != nil {
+		panic(err)
+	}
+	return httputil.NewSingleHostReverseProxy(url)
 }
 
 func route(w http.ResponseWriter, r *http.Request) {
 	host, _, err := net.SplitHostPort(r.Host)
 	if err != nil {
-		log.Error("failed to extract domain from Host: %s", r.Host)
+		log.Errorf("failed to extract domain from Host %q: %v", r.Host, err)
 		w.WriteHeader(500)
 		return
 	}
+
 	rlog := log.WithFields(log.Fields{"Host": host, "path": r.URL.Path})
-	w = &ResponseWriter{w, r, rlog, false}
-	if host == "app.map.dev" {
-		rlog.Info("proxying to Editor")
-		editorProxy.ServeHTTP(w, r)
+
+	switch host {
+	case "api.map.dev":
+		hlog := rlog.WithField("app", "MAP API")
+		hlog.Info("reverse-proxying")
+		mapProxy.ServeHTTP(w, r)
+		return
+	case "app.map.dev":
+		hlog := rlog.WithField("app", "Editor")
+		tryFile(w, r, editorPublic, editorProxy, hlog)
+		return
+	case "map.dev":
+		hlog := rlog.WithField("app", "MAP")
+		if m := uploadsCMSRe.FindStringSubmatch(r.URL.Path); m != nil {
+			//
+			// Example URL:
+			// /uploads_cms/block_taxon-image-610/livre-photo.png
+			//
+			// Matched with:
+			// ^/uploads_cms/(\w+)-(\w+)-(\d+)/(.+)$
+			//
+			// File:
+			// public/uploads/cms/block_taxon/image/610/livre-photo.png
+			//
+			filePath := fmt.Sprintf("/uploads/cms/%s/%s/%s/%s", m[1], m[2], m[3], m[4])
+			ulog := hlog.WithField("file", filePath)
+			ulog.Info("sending uploads_cms")
+			r.URL.Path = filePath
+			mapPublic.ServeHTTP(w, r)
+			return
+		}
+		w = responseWriter{w, r, false, rlog} // support X-Accel-Redirect to /storage
+		tryFile(w, r, mapPublic, mapProxy, hlog)
 		return
 	}
-	if h := static[r.URL.Path]; h != nil {
-		rlog.Info("static path match")
-		h(w, r)
+
+	if isNop(r.URL.Path) {
+		rlog.Info("nop")
+		http.NotFound(w, r)
 		return
 	}
-	if m := uploadsCMSRe.FindStringSubmatch(r.URL.Path); m != nil {
-		rlog.Info("sending uploads_cms")
-		r.URL.Path = fmt.Sprintf("/uploads/cms/%s/image/%s/%s/%s", m[1], m[2], m[3], m[4])
-		publicHandler.ServeHTTP(w, r)
-		return
-	}
-	ok, err := filetest.IsFile(filepath.Join(string(public), r.URL.Path))
+
+	rlog.Errorf("unknown Host")
+	http.NotFound(w, r)
+}
+
+func tryFile(w http.ResponseWriter, r *http.Request, public fileServer, app http.Handler, log *log.Entry) {
+	ok, err := filetest.IsFile(filepath.Join(public.dir, r.URL.Path))
 	if err != nil {
-		rlog.Errorf("while testing file: %v", err)
+		log.Errorf("while testing file: %v", err)
 		w.WriteHeader(500)
 		return
 	}
 	if ok {
-		rlog.Info("sending file")
-		publicHandler.ServeHTTP(w, r)
+		log.Info("sending public file")
+		public.ServeHTTP(w, r)
 		return
 	}
-	rlog.Info("proxying to MAP")
-	mapProxy.ServeHTTP(w, r)
+	log.Info("reverse-proxying")
+	app.ServeHTTP(w, r)
 }
 
-type ResponseWriter struct {
-	final   http.ResponseWriter
+func isNop(path string) bool {
+	for _, re := range nop {
+		if re.MatchString(path) {
+			return true
+		}
+	}
+	return false
+}
+
+type responseWriter struct {
+	res     http.ResponseWriter
 	req     *http.Request
-	log     *log.Entry
 	written bool
+	log     *log.Entry
 }
 
-func (w *ResponseWriter) Header() http.Header {
-	return w.final.Header()
+func (w responseWriter) Header() http.Header {
+	return w.res.Header()
 }
 
-func (w *ResponseWriter) Write(chunk []byte) (int, error) {
+func (w responseWriter) Write(chunk []byte) (int, error) {
 	w.written = true
-	return w.final.Write(chunk)
+	return w.res.Write(chunk)
 }
 
-func (w *ResponseWriter) WriteHeader(status int) {
-	if redir := w.final.Header().Get("X-Accel-Redirect"); redir != "" {
+func (w responseWriter) WriteHeader(status int) {
+	if redir := w.res.Header().Get("X-Accel-Redirect"); redir != "" {
 		rlog := w.log.WithFields(log.Fields{"X-Accel-Redirect": redir})
 		if w.written {
 			rlog.Errorf("attempted to X-Accel-Redirect after write")
-		} else {
-			if path := strings.TrimPrefix(redir, "/storage/"); len(path) < len(redir) {
-				rlog.Debugf("proxying to Storage")
-				w.req.URL.Path = path
-				for _, key := range xAccelRedirectHopHeaders {
-					w.Header().Del(key)
-				}
-				w.written = true
-				storageProxy.ServeHTTP(w.final, w.req)
-				return
-			}
-			rlog.Debugf("unhandled X-Accel-Redirect")
+			return
 		}
+		if path := strings.TrimPrefix(redir, "/storage/"); path != redir {
+			hlog := rlog.WithField("app", "Storage")
+			hlog.Infof("reverse-proxying")
+			w.req.URL.Path = path
+			for _, key := range xAccelRedirectHopHeaders {
+				w.Header().Del(key)
+			}
+			w.written = true
+			storageProxy.ServeHTTP(w.res, w.req)
+			return
+		}
+		rlog.Debugf("unhandled X-Accel-Redirect")
 	}
 	w.written = true
-	w.final.WriteHeader(status)
+	w.res.WriteHeader(status)
 }
